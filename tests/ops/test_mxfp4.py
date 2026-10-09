@@ -75,6 +75,159 @@ def test_shuffled_col_operand_matches_separate_shuffle_pass(shape):
     torch.testing.assert_close(col_f, _shuffle_mxfp4_weight(col), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 operand layout")
+@pytest.mark.parametrize("use_sr", [False, True])
+@pytest.mark.parametrize(
+    "logical_rows,target_rows",
+    [(1, 256), (255, 256), (257, 512), (542, 1024), (1025, 2048)],
+)
+def test_dual_layout_target_rows_matches_explicit_padding(
+    use_sr, logical_rows, target_rows,
+):
+    width = 256
+    torch.manual_seed(31)
+    x = torch.randn(
+        (logical_rows, width), device="cuda", dtype=torch.bfloat16,
+    )
+    padded = torch.cat(
+        [
+            x,
+            torch.zeros(
+                (target_rows - logical_rows, width),
+                device=x.device,
+                dtype=x.dtype,
+            ),
+        ],
+        dim=0,
+    )
+    sign = torch.ones(G, device=x.device, dtype=torch.bfloat16)
+    kwargs = dict(
+        block_size=BLOCK,
+        g=G,
+        use_sr_row=use_sr,
+        use_sr_transposed=use_sr,
+        philox_seed=1234,
+        philox_offset=5678,
+        swizzle_scale=True,
+        shuffle_col=True,
+    )
+
+    ref = dual_layout_quant_mxfp4(padded, sign, **kwargs)
+    got = dual_layout_quant_mxfp4(
+        x, sign, target_rows=target_rows, **kwargs,
+    )
+
+    for actual, expected in zip(got, ref):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 operand layout")
+@pytest.mark.parametrize(
+    "logical_rows,target_rows",
+    [(1, 256), (255, 256), (257, 512), (542, 1024), (1025, 2048)],
+)
+def test_dequant_hadamard_target_rows_matches_explicit_padding(
+    logical_rows, target_rows,
+):
+    from lumen.ops.quantize.ops import (
+        convert_to_mxfp4,
+        dequant_hadamard_quant_mxfp4,
+    )
+
+    width = 256
+    torch.manual_seed(37)
+    x = torch.randn(
+        (logical_rows, width), device="cuda", dtype=torch.bfloat16,
+    )
+    data, scales = convert_to_mxfp4(
+        x, block_size=BLOCK, axis=-1, use_sr=False,
+    )
+    data_padded = torch.cat(
+        [
+            data,
+            torch.zeros(
+                (target_rows - logical_rows, data.shape[1]),
+                device=data.device,
+                dtype=data.dtype,
+            ),
+        ],
+        dim=0,
+    )
+    scales_padded = torch.cat(
+        [
+            scales,
+            torch.zeros(
+                (target_rows - logical_rows, scales.shape[1]),
+                device=scales.device,
+                dtype=scales.dtype,
+            ),
+        ],
+        dim=0,
+    )
+    sign = torch.ones(G, device=x.device, dtype=torch.bfloat16)
+    kwargs = dict(
+        block_size=BLOCK,
+        g=G,
+        use_sr=False,
+        swizzle_scale=True,
+        shuffle_data=True,
+    )
+
+    ref = dequant_hadamard_quant_mxfp4(
+        data_padded, scales_padded, sign, **kwargs,
+    )
+    got = dequant_hadamard_quant_mxfp4(
+        data, scales, sign, target_rows=target_rows, **kwargs,
+    )
+
+    for actual, expected in zip(got, ref):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 MXFP4 backward")
+def test_ragged_linear_backward_dispatches_target_rows(monkeypatch):
+    import lumen.ops.quantize.linear as lin
+
+    logical_rows, target_rows, width = 542, 1024, 256
+    torch.manual_seed(41)
+    x = torch.randn(
+        (logical_rows, width), device="cuda", dtype=torch.bfloat16,
+    )
+    w = torch.randn(
+        (width, width), device="cuda", dtype=torch.bfloat16,
+    )
+    dy = torch.randn_like(x)
+    calls = []
+    dispatch = lin.gemm_mxfp4_dispatch
+
+    def record_dispatch(a, b, sa, sb):
+        calls.append((tuple(a.shape), tuple(b.shape)))
+        return dispatch(a, b, sa, sb)
+
+    monkeypatch.setattr(lin, "_MXFP4_WGRAD_TILE_PAD", True)
+    monkeypatch.setattr(lin, "_MXFP4_WGRAD_POWER2_BUCKET", True)
+    monkeypatch.setattr(lin, "_MXFP4_FUSED_TARGET_ROWS", True)
+    monkeypatch.setattr(lin, "gemm_mxfp4_dispatch", record_dispatch)
+
+    out, dx, dw = _run_linear(x, w, dy)
+
+    assert out.shape == x.shape
+    assert dx.shape == x.shape
+    assert dw.shape == w.shape
+    assert all(torch.isfinite(t).all() for t in (out, dx, dw))
+    # Only WGrad reduces over the token axis, so only its A operand is
+    # (width, target_rows // 2); forward and DGrad carry width // 2 columns.
+    wgrad = [call for call in calls if call[0][1] == target_rows // 2]
+    assert wgrad == [
+        ((width, target_rows // 2), (width, target_rows // 2)),
+    ]
+
+    monkeypatch.setattr(lin, "_MXFP4_FUSED_TARGET_ROWS", False)
+    ref = _run_linear(x, w, dy)
+    for actual, expected in zip((out, dx, dw), ref):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not _is_gfx950(), reason="gfx950 scale layout")
 @pytest.mark.parametrize("M,K,N", [(512, 4096, 4096), (256, 2048, 512)])
 def test_mxfp4_linear_fused_act_scale_matches_row_major(M, K, N, monkeypatch):

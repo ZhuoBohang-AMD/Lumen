@@ -613,6 +613,9 @@ def test_mxfp4_quant_unaligned_rows_are_reproducible(M):
     torch.cuda.manual_seed(42)
     x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
     sign = torch.randint(0, 2, (N // 16, 16), device="cuda", dtype=torch.bfloat16) * 2 - 1
+    stored_fp4, stored_scales = convert_to_mxfp4(
+        x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+    )
 
     paths = {
         "1d": lambda: convert_to_mxfp4(x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False),
@@ -623,6 +626,10 @@ def test_mxfp4_quant_unaligned_rows_are_reproducible(M):
         "dual_layout": lambda: dual_layout_quant_mxfp4(
             x, sign, block_size=MXFP4_BLOCK_SIZE,
             use_sr_row=False, use_sr_transposed=False,
+        ),
+        "dequant_hadamard": lambda: dequant_hadamard_quant_mxfp4(
+            stored_fp4, stored_scales, sign,
+            block_size=MXFP4_BLOCK_SIZE, use_sr=False,
         ),
     }
 
@@ -856,8 +863,8 @@ def test_mxfp4_dual_axis_vs_torchao(shape):
 
 @pytest.mark.parametrize(
     "M,K",
-    [(4096, 4096), (2048, 12288), (512, 128)],
-    ids=["square", "wide", "small"],
+    [(4096, 4096), (2048, 12288), (512, 128), (96, 256), (160, 256)],
+    ids=["square", "wide", "small", "ragged96", "ragged160"],
 )
 def test_mxfp4_dequant_hadamard_quant_matches_two_pass(M, K):
     """The fused WGrad activation path must equal the two kernels it replaces.
@@ -1493,7 +1500,7 @@ def test_mxfp4_preshuffle_gemm_matches_plain(M, N, K):
 
 
 def test_mxfp4_preshuffle_eligibility():
-    """Only large, 16-row-aligned weights should take the shuffle prologue."""
+    """Only shapes with complete gfx950 M/K tiles take the shuffle prologue."""
     _require_mxfp4_dtype()
     if os.environ.get("LUMEN_MXFP4_PRESHUFFLE") is not None:
         pytest.skip("LUMEN_MXFP4_PRESHUFFLE overrides the policy this test pins down")
@@ -1514,6 +1521,18 @@ def test_mxfp4_preshuffle_eligibility():
     # N must tile by 16, and the kernel needs M >= 32.
     assert not _mxfp4_preshuffle_eligible(*_operands(2048, 28680, 4096))
     assert not _mxfp4_preshuffle_eligible(*_operands(16, 28672, 4096))
+
+    # A-scale loads do not mask a partial BLOCK_M tile. These are the padded
+    # DGrad row counts from observed Kimi-K3 ragged batches.
+    assert not _mxfp4_preshuffle_supported(*_operands(544, 512, 16384))
+    assert not _mxfp4_preshuffle_supported(*_operands(992, 512, 16384))
+    assert _mxfp4_preshuffle_supported(*_operands(1024, 512, 16384))
+
+    # The kernel has no non-EVEN_K implementation. Ragged Kimi-K3 WGrad
+    # reductions are padded to 32, but must stay on the plain kernel unless
+    # they also tile by the largest gfx950 BLOCK_K.
+    assert not _mxfp4_preshuffle_supported(*_operands(16384, 512, 992))
+    assert _mxfp4_preshuffle_supported(*_operands(16384, 512, 1024))
 
 
 @pytest.mark.parametrize(
@@ -2237,7 +2256,9 @@ def test_mxfp4_remeasure_excludes_plain_for_shuffled_weight(monkeypatch):
     try:
         mxfp4_autotune._choice[key] = "asm"
         monkeypatch.setattr(linear_mod, "_mxfp4_backend_legality", lambda k, x, y: (False, True))
-        monkeypatch.setattr(linear_mod, "_mxfp4_preshuffle_eligible", lambda x, y: False)
+        monkeypatch.setattr(
+            linear_mod, "_mxfp4_preshuffle_eligible_shape", lambda m, n, k: False
+        )
 
         def _pick(_key, candidates, fallback=None):
             assert [name for name, _fn in candidates] == ["shuffled"]
@@ -2402,6 +2423,36 @@ def test_mxfp4_shape_log_records_all_three_gemms(tmp_path):
     assert (M, N, K) in seen, f"fprop shape missing from {seen}"
     assert (M, K, N) in seen, f"dgrad shape missing from {seen}"
     assert (N, K, M) in seen, f"wgrad shape missing from {seen}"
+
+
+def test_mxfp4_shape_log_is_rank_zero_and_atomic(tmp_path, monkeypatch):
+    log = tmp_path / "shapes.csv"
+    original = mxfp4_autotune._SHAPE_LOG_PATH
+    mxfp4_autotune._SHAPE_LOG_PATH = str(log)
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune.record_shape((32, 64, 128), tuned=True, backend="plain")
+        monkeypatch.setenv("RANK", "1")
+        mxfp4_autotune._save_shape_log()
+        assert not log.exists()
+
+        monkeypatch.setenv("RANK", "0")
+        mxfp4_autotune._save_shape_log()
+        rows = list(csv.DictReader(log.open()))
+        assert rows == [
+            {
+                "M": "32",
+                "N": "64",
+                "K": "128",
+                "tuned": "1",
+                "backend": "plain",
+                "calls": "1",
+            }
+        ]
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        mxfp4_autotune._SHAPE_LOG_PATH = original
+        mxfp4_autotune.clear()
 
 
 @pytest.mark.parametrize(
